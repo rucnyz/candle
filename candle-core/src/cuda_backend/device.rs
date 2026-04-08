@@ -289,7 +289,13 @@ impl BackendDevice for CudaDevice {
 
     fn new(ordinal: usize) -> Result<Self> {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
-        let stream = context.default_stream();
+        // Use a non-blocking stream instead of the default (null) stream.
+        // The null stream has global synchronization semantics that serialize
+        // all GPU operations. It also cannot be used with CUDA graph capture.
+        let stream = context.new_stream().w()?;
+        // Disable event tracking since we only use a single stream.
+        // Event recording during CUDA graph capture causes errors.
+        unsafe { context.disable_event_tracking(); }
         #[cfg(feature = "cublas")]
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         #[cfg(feature = "curand")]
