@@ -6,16 +6,6 @@ pub enum CudaError {
     #[error(transparent)]
     Cuda(#[from] cudarc::driver::DriverError),
 
-    #[error(transparent)]
-    Compiler(#[from] cudarc::nvrtc::CompileError),
-
-    #[cfg(feature = "cublas")]
-    #[error(transparent)]
-    Cublas(#[from] cudarc::cublas::result::CublasError),
-
-    #[cfg(feature = "curand")]
-    #[error(transparent)]
-    Curand(#[from] cudarc::curand::result::CurandError),
 
     #[error("missing kernel '{module_name}'")]
     MissingKernel { module_name: String },

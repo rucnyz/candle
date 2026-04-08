@@ -5,8 +5,6 @@ use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{builder_arg as barg, CpuStorage, DType, Layout, Result, WithDType};
 pub use candle_kernels as kernels;
 pub use cudarc;
-#[cfg(feature = "cublas")]
-use cudarc::cublas::{Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::driver::{
     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
@@ -14,12 +12,9 @@ use half::{bf16, f16};
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
-#[cfg(not(feature = "cublas"))]
-pub mod gemm_dispatch;
-#[cfg(not(feature = "cublas"))]
-pub use gemm_dispatch::register_gemm_dispatch;
 mod device;
 mod error;
+pub mod gemm_dispatch;
 mod utils;
 pub use device::{CudaDevice, DeviceId};
 pub use error::{CudaError, WrapErr};
@@ -62,7 +57,7 @@ impl SlicePtrOrNull<usize> {
         let ds = if l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[l.dims(), l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.clone_htod_cached_usize(&[l.dims(), l.stride()].concat())?)
         };
         Ok(ds)
     }
@@ -192,7 +187,7 @@ impl Map1 for Im2Col1D {
         let l_out = self.l_out(dims[2]);
         let threads = dims[0] * l_out * dims[1];
         let cfg = LaunchConfig::for_num_elems(threads as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = dev.clone_htod_cached_usize(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col1d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -243,7 +238,7 @@ impl Map1 for Im2Col {
         let (h_out, w_out) = self.hw_out(dims[2], dims[3]);
         let dst_el = dims[0] * h_out * w_out * dims[1] * self.h_k * self.w_k;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let ds = dev.clone_htod(&[dims, layout.stride()].concat())?;
+        let ds = dev.clone_htod_cached_usize(&[dims, layout.stride()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>("im2col"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
@@ -335,7 +330,7 @@ impl Map1Any for FastReduce<'_> {
             block_dim: (block_dim as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let ds = dev.clone_htod(&[dims.as_slice(), stride.as_slice()].concat())?;
+        let ds = dev.clone_htod_cached_usize(&[dims.as_slice(), stride.as_slice()].concat())?;
         let src = &src.slice(layout.start_offset()..);
         let (name, check_empty, return_index) = match self.1 {
             ReduceOp::Sum => ("fast_sum", false, false),
@@ -434,7 +429,7 @@ impl Map1 for IndexSelect<'_> {
         };
         let ids_shape = ids_l.shape();
         let ids_dims = ids_shape.dims();
-        let ds = dev.clone_htod(&[ids_dims, ids_l.stride()].concat())?;
+        let ds = dev.clone_htod_cached_usize(&[ids_dims, ids_l.stride()].concat())?;
         let src = match src_l.contiguous_offsets() {
             Some((o1, o2)) => src.slice(o1..o2),
             None => Err(crate::Error::RequiresContiguous { op: "index-select" }.bt())?,
@@ -707,7 +702,7 @@ impl Map2 for Conv1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el, l_out, p.stride, p.padding, p.dilation);
         builder.arg(&ds);
@@ -750,7 +745,7 @@ impl Map2 for Conv2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el, out_w, out_h, p.stride, p.padding, p.dilation);
         builder.arg(&ds);
@@ -821,7 +816,7 @@ impl Map2 for ConvTranspose1D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose1d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, l_out);
@@ -869,7 +864,7 @@ impl Map2 for ConvTranspose2D<'_> {
         } else {
             crate::bail!("unexpected input shape for conv_transpose2d {dims:?}")
         };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, out_w);
@@ -929,7 +924,7 @@ impl Map1 for Pool2D {
         let func = dev.get_or_load_func(&kernel_name::<T>(kname), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
         let mut builder = func.builder();
         barg!(builder, el);
         barg!(builder, self.w_k);
@@ -968,7 +963,7 @@ impl Map1 for UpsampleNearest2D {
         let func = dev.get_or_load_func(&kernel_name::<T>("upsample_nearest2d"), &kernels::CONV)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
         let scale_w = dims[2] as f64 / out_w as f64;
         let scale_h = dims[3] as f64 / out_h as f64;
         let mut builder = func.builder();
@@ -1017,7 +1012,7 @@ impl Map1 for UpsampleBilinear2D {
 
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
-        let ds = dev.clone_htod(&ds)?;
+        let ds = dev.clone_htod_cached_usize(&ds)?;
 
         let mut builder = func.builder();
         barg!(builder, out_w);
@@ -1073,7 +1068,7 @@ impl Map2 for WhereCond<'_> {
         let el = shape.elem_count();
         let cfg = LaunchConfig::for_num_elems(el as u32);
         let ds =
-            dev.clone_htod(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
+            dev.clone_htod_cached_usize(&[dims, ids_l.stride(), layout_t.stride(), layout_f.stride()].concat())?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
         let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::TERNARY)?;
@@ -1109,7 +1104,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.clone_htod_cached_usize(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1146,7 +1141,7 @@ impl Map2Any for Cmp {
         let dims_and_strides = if lhs_l.is_contiguous() && rhs_l.is_contiguous() {
             SlicePtrOrNull::Null
         } else {
-            SlicePtrOrNull::Ptr(dev.clone_htod(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
+            SlicePtrOrNull::Ptr(dev.clone_htod_cached_usize(&[dims, lhs_l.stride(), rhs_l.stride()].concat())?)
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
@@ -1343,163 +1338,6 @@ impl CudaStorage {
             device: dst.clone(),
         })
     }
-}
-
-#[cfg(feature = "cublas")]
-fn gemm_config<T>(
-    alpha: T,
-    beta: T,
-    (b, m, n, k): (usize, usize, usize, usize),
-    lhs_l: &Layout,
-    rhs_l: &Layout,
-) -> Result<StridedBatchedConfig<T>> {
-    // https://docs.nvidia.com/cuda/cublas/index.html#cublas-t-gemm
-    use cudarc::cublas::sys::cublasOperation_t;
-
-    let lhs_stride = lhs_l.stride();
-    let rhs_stride = rhs_l.stride();
-    let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
-    let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
-    let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
-    let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
-    // The a tensor has dims batching, k, n (rhs)
-    // We also allow for the case where the stride on the minor dimension is not as expected but
-    // there is a single element.
-    let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-        (n as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?
-    };
-    // The b tensor has dims batching, m, k (lhs)
-    // We also allow for the case where the stride on the minor dimension is not as expected but
-    // there is a single element.
-    let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-        (k as i32, cublasOperation_t::CUBLAS_OP_N)
-    } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
-        (m as i32, cublasOperation_t::CUBLAS_OP_T)
-    } else {
-        Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?
-    };
-    // The setup below was copied from:
-    // https://github.com/lebedov/scikit-cuda/blob/7e7300474286019c917a6c8a4bca59405c64fbce/tests/test_cublas.py#L531
-    let gemm = GemmConfig {
-        alpha,
-        beta,
-        m: n as i32,
-        n: m as i32,
-        k: k as i32,
-        lda,
-        ldb,
-        ldc: n as i32,
-        transa,
-        transb,
-    };
-
-    let stride_b: usize = match lhs_stride[..lhs_stride.len() - 2] {
-        [s1, stride] if s1 == stride * lhs_l.dims()[1] => stride,
-        [_, stride] if lhs_l.dims()[0] == 1 => stride,
-        [stride, _] if lhs_l.dims()[1] == 1 => stride,
-        [stride] => stride,
-        [] => m * k,
-        _ => Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?,
-    };
-    let stride_a: usize = match rhs_stride[..rhs_stride.len() - 2] {
-        [s1, stride] if s1 == stride * rhs_l.dims()[1] => stride,
-        [_, stride] if rhs_l.dims()[0] == 1 => stride,
-        [stride, _] if rhs_l.dims()[1] == 1 => stride,
-        [stride] => stride,
-        [] => n * k,
-        _ => Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?,
-    };
-    Ok(StridedBatchedConfig {
-        batch_size: b as i32,
-        gemm,
-        stride_a: stride_a as i64,
-        stride_b: stride_b as i64,
-        stride_c: (m * n) as i64,
-    })
-}
-
-/// Compute GEMM layout parameters from candle Layout (cuBLAS column-major convention).
-#[cfg(not(feature = "cublas"))]
-fn gemm_layout(
-    (_b, m, n, k): (usize, usize, usize, usize),
-    lhs_l: &Layout,
-    rhs_l: &Layout,
-) -> Result<(i32, i32, bool, bool, i64, i64)> {
-    let lhs_stride = lhs_l.stride();
-    let rhs_stride = rhs_l.stride();
-    let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
-    let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
-    let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
-    let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
-
-    let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
-        (n as i32, false)
-    } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
-        (k as i32, true)
-    } else {
-        Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?
-    };
-    let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
-        (k as i32, false)
-    } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
-        (m as i32, true)
-    } else {
-        Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?
-    };
-
-    let stride_b: usize = match lhs_stride[..lhs_stride.len() - 2] {
-        [s1, stride] if s1 == stride * lhs_l.dims()[1] => stride,
-        [_, stride] if lhs_l.dims()[0] == 1 => stride,
-        [stride, _] if lhs_l.dims()[1] == 1 => stride,
-        [stride] => stride,
-        [] => m * k,
-        _ => Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?,
-    };
-    let stride_a: usize = match rhs_stride[..rhs_stride.len() - 2] {
-        [s1, stride] if s1 == stride * rhs_l.dims()[1] => stride,
-        [_, stride] if rhs_l.dims()[0] == 1 => stride,
-        [stride, _] if rhs_l.dims()[1] == 1 => stride,
-        [stride] => stride,
-        [] => n * k,
-        _ => Err(CudaError::MatMulNonContiguous {
-            lhs_stride: lhs_l.clone(),
-            rhs_stride: rhs_l.clone(),
-            mnk: (m, n, k),
-        })?,
-    };
-    Ok((lda, ldb, transa, transb, stride_a as i64, stride_b as i64))
 }
 
 impl BackendStorage for CudaStorage {
@@ -2262,138 +2100,133 @@ impl BackendStorage for CudaStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        #[cfg(feature = "cublas")]
-        {
-            let elem_count = b * m * n;
-            let dev = &self.device;
-            let slice = match (&self.slice, &rhs.slice) {
-                (CudaStorageSlice::BF16(lhs), CudaStorageSlice::BF16(rhs)) => {
-                    let lhs = &lhs.slice(lhs_l.start_offset()..);
-                    let rhs = &rhs.slice(rhs_l.start_offset()..);
-                    let cfg = gemm_config(bf16::ONE, bf16::ZERO, (b, m, n, k), lhs_l, rhs_l)?;
-                    let mut out = unsafe { dev.alloc::<bf16>(elem_count)? };
-                    unsafe {
-                        gemm_strided_batched_bf16(&self.device.blas, cfg, rhs, lhs, &mut out)
-                    }
-                    .w()?;
-                    CudaStorageSlice::BF16(out)
-                }
-                (CudaStorageSlice::F16(lhs), CudaStorageSlice::F16(rhs)) => {
-                    let lhs = &lhs.slice(lhs_l.start_offset()..);
-                    let rhs = &rhs.slice(rhs_l.start_offset()..);
-                    let cfg = gemm_config(f16::ONE, f16::ZERO, (b, m, n, k), lhs_l, rhs_l)?;
-                    let mut out = unsafe { dev.alloc::<f16>(elem_count)? };
-                    unsafe {
-                        gemm_strided_batched_f16(&self.device.blas, cfg, rhs, lhs, &mut out)
-                    }
-                    .w()?;
-                    CudaStorageSlice::F16(out)
-                }
-                (CudaStorageSlice::F32(lhs), CudaStorageSlice::F32(rhs)) => {
-                    let lhs = &lhs.slice(lhs_l.start_offset()..);
-                    let rhs = &rhs.slice(rhs_l.start_offset()..);
-                    let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
-                    let mut out = unsafe { dev.alloc::<f32>(elem_count)? };
-                    unsafe {
-                        gemm_strided_batched_f32(&self.device.blas, cfg, rhs, lhs, &mut out)
-                    }
-                    .w()?;
-                    CudaStorageSlice::F32(out)
-                }
-                (CudaStorageSlice::F64(lhs), CudaStorageSlice::F64(rhs)) => {
-                    let lhs = &lhs.slice(lhs_l.start_offset()..);
-                    let rhs = &rhs.slice(rhs_l.start_offset()..);
-                    let cfg = gemm_config(1., 0., (b, m, n, k), lhs_l, rhs_l)?;
-                    let mut out = unsafe { dev.alloc::<f64>(elem_count)? };
-                    unsafe {
-                        self.device
-                            .blas
-                            .gemm_strided_batched(cfg, rhs, lhs, &mut out)
-                    }
-                    .w()?;
-                    CudaStorageSlice::F64(out)
-                }
-                _ => Err(CudaError::InternalError("dtype mismatch in matmul op"))?,
-            };
-            let device = dev.clone();
-            Ok(Self { slice, device })
-        }
+        use cudarc::driver::DevicePtr;
 
-        #[cfg(not(feature = "cublas"))]
-        {
-            use std::ffi::c_void;
-            use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let elem_count = b * m * n;
+        let dev = &self.device;
+        let stream = dev.cuda_stream();
 
-            let elem_count = b * m * n;
-            let dev = &self.device;
-            let dtype_code: u32 = match self.dtype() {
-                DType::BF16 => 0,
-                DType::F16 => 1,
-                DType::F32 => 2,
-                DType::F64 => 3,
-                dt => Err(CudaError::UnsupportedDtype {
-                    dtype: dt,
-                    op: "matmul",
-                })?,
-            };
-            let (lda, ldb, transa, transb, stride_a, stride_b) =
-                gemm_layout((b, m, n, k), lhs_l, rhs_l)?;
+        // Compute strides and transpose flags (same logic as cuBLAS layout mapping)
+        let lhs_stride = lhs_l.stride();
+        let rhs_stride = rhs_l.stride();
+        let rhs_m1 = rhs_stride[rhs_stride.len() - 1];
+        let rhs_m2 = rhs_stride[rhs_stride.len() - 2];
+        let lhs_m1 = lhs_stride[lhs_stride.len() - 1];
+        let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
 
-            macro_rules! dispatch_gemm {
-                ($lhs_slice:expr, $rhs_slice:expr, $ty:ty, $variant:ident) => {{
-                    let lhs = &$lhs_slice.slice(lhs_l.start_offset()..);
-                    let rhs = &$rhs_slice.slice(rhs_l.start_offset()..);
-                    let mut out = unsafe { dev.alloc::<$ty>(elem_count)? };
-                    let stream = dev.cuda_stream();
-                    {
-                        let (lhs_ptr, _g1) = lhs.device_ptr(&stream);
-                        let (rhs_ptr, _g2) = rhs.device_ptr(&stream);
-                        let (out_ptr, _g3) = out.device_ptr_mut(&stream);
-                        gemm_dispatch::call_gemm(
-                            rhs_ptr as *const c_void,
-                            lhs_ptr as *const c_void,
-                            out_ptr as *mut c_void,
-                            n as i32,
-                            m as i32,
-                            k as i32,
-                            b as i32,
-                            lda,
-                            ldb,
-                            n as i32,
-                            stride_a,
-                            stride_b,
-                            (m * n) as i64,
-                            transa,
-                            transb,
-                            dtype_code,
-                            stream.cu_stream() as *const c_void,
-                        )
-                        .map_err(|e| {
-                            CudaError::InternalError(Box::leak(e.into_boxed_str()))
-                        })?;
-                    }
-                    CudaStorageSlice::$variant(out)
-                }};
+        // rhs (A in cuBLAS notation): [b, k, n]
+        let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
+            (n as i32, false)
+        } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
+            (k as i32, true)
+        } else {
+            Err(CudaError::MatMulNonContiguous {
+                lhs_stride: lhs_l.clone(),
+                rhs_stride: rhs_l.clone(),
+                mnk: (m, n, k),
+            })?
+        };
+
+        // lhs (B in cuBLAS notation): [b, m, k]
+        let (ldb, transb) = if (lhs_m1 == 1 || k == 1) && (lhs_m2 == k || m == 1) {
+            (k as i32, false)
+        } else if (lhs_m1 == m || k == 1) && (lhs_m2 == 1 || m == 1) {
+            (m as i32, true)
+        } else {
+            Err(CudaError::MatMulNonContiguous {
+                lhs_stride: lhs_l.clone(),
+                rhs_stride: rhs_l.clone(),
+                mnk: (m, n, k),
+            })?
+        };
+
+        let stride_b: usize = match lhs_stride[..lhs_stride.len() - 2] {
+            [s1, stride] if s1 == stride * lhs_l.dims()[1] => stride,
+            [_, stride] if lhs_l.dims()[0] == 1 => stride,
+            [stride, _] if lhs_l.dims()[1] == 1 => stride,
+            [stride] => stride,
+            [] => m * k,
+            _ => Err(CudaError::MatMulNonContiguous {
+                lhs_stride: lhs_l.clone(),
+                rhs_stride: rhs_l.clone(),
+                mnk: (m, n, k),
+            })?,
+        };
+        let stride_a: usize = match rhs_stride[..rhs_stride.len() - 2] {
+            [s1, stride] if s1 == stride * rhs_l.dims()[1] => stride,
+            [_, stride] if rhs_l.dims()[0] == 1 => stride,
+            [stride, _] if rhs_l.dims()[1] == 1 => stride,
+            [stride] => stride,
+            [] => n * k,
+            _ => Err(CudaError::MatMulNonContiguous {
+                lhs_stride: lhs_l.clone(),
+                rhs_stride: rhs_l.clone(),
+                mnk: (m, n, k),
+            })?,
+        };
+
+        // Determine dtype code and extract pointers + allocate output
+        let dtype_code = match (&self.slice, &rhs.slice) {
+            (CudaStorageSlice::BF16(_), CudaStorageSlice::BF16(_)) => 0u32,
+            (CudaStorageSlice::F16(_), CudaStorageSlice::F16(_)) => 1u32,
+            (CudaStorageSlice::F32(_), CudaStorageSlice::F32(_)) => 2u32,
+            (CudaStorageSlice::F64(_), CudaStorageSlice::F64(_)) => {
+                return Err(CudaError::InternalError(
+                    "F64 GPU matmul not supported (cuBLAS removed). Use F32 instead."
+                ).into())
             }
+            _ => Err(CudaError::InternalError("dtype mismatch in matmul op"))?,
+        };
 
-            let slice = match (&self.slice, &rhs.slice) {
-                (CudaStorageSlice::BF16(l), CudaStorageSlice::BF16(r)) => {
-                    dispatch_gemm!(l, r, bf16, BF16)
+        // Get raw pointers — using the base slice pointer + byte offset via start_offset
+        // cudarc CudaSlice pointers are stable (no guard needed for same-stream access)
+        let raw_stream = unsafe { stream.cu_stream() };
+
+        macro_rules! do_gemm {
+            ($lhs_slice:expr, $rhs_slice:expr, $out_ty:ident, $elem:ty) => {{
+                let lhs_s = &$lhs_slice.slice(lhs_l.start_offset()..);
+                let rhs_s = &$rhs_slice.slice(rhs_l.start_offset()..);
+                let out = unsafe { dev.alloc::<$elem>(elem_count)? };
+
+                // Scope the pointer borrows so guards drop before `out` is moved
+                {
+                    let (lhs_ptr, _g1) = lhs_s.device_ptr(&stream);
+                    let (rhs_ptr, _g2) = rhs_s.device_ptr(&stream);
+                    let (out_ptr, _g3) = out.device_ptr(&stream);
+
+                    gemm_dispatch::call_gemm(
+                        rhs_ptr as u64 as *const std::ffi::c_void,
+                        lhs_ptr as u64 as *const std::ffi::c_void,
+                        out_ptr as u64 as *mut std::ffi::c_void,
+                        n as i32, m as i32, k as i32,
+                        b as i32,
+                        lda, ldb, n as i32,
+                        stride_a as i64, stride_b as i64, (m * n) as i64,
+                        transa, transb,
+                        dtype_code,
+                        raw_stream as *const std::ffi::c_void,
+                    ).map_err(|e| CudaError::InternalError(Box::leak(e.into_boxed_str())))?;
                 }
-                (CudaStorageSlice::F16(l), CudaStorageSlice::F16(r)) => {
-                    dispatch_gemm!(l, r, f16, F16)
-                }
-                (CudaStorageSlice::F32(l), CudaStorageSlice::F32(r)) => {
-                    dispatch_gemm!(l, r, f32, F32)
-                }
-                (CudaStorageSlice::F64(l), CudaStorageSlice::F64(r)) => {
-                    dispatch_gemm!(l, r, f64, F64)
-                }
-                _ => Err(CudaError::InternalError("dtype mismatch in matmul op"))?,
-            };
-            let device = dev.clone();
-            Ok(Self { slice, device })
+
+                CudaStorageSlice::$out_ty(out)
+            }};
         }
+
+        let slice = match (&self.slice, &rhs.slice) {
+            (CudaStorageSlice::BF16(lhs), CudaStorageSlice::BF16(rhs)) => {
+                do_gemm!(lhs, rhs, BF16, bf16)
+            }
+            (CudaStorageSlice::F16(lhs), CudaStorageSlice::F16(rhs)) => {
+                do_gemm!(lhs, rhs, F16, f16)
+            }
+            (CudaStorageSlice::F32(lhs), CudaStorageSlice::F32(rhs)) => {
+                do_gemm!(lhs, rhs, F32, f32)
+            }
+            _ => unreachable!(), // already checked above
+        };
+
+        let device = dev.clone();
+        Ok(Self { slice, device })
     }
 
     fn copy2d(
@@ -2623,227 +2456,3 @@ impl BackendStorage for CudaStorage {
     }
 }
 
-// Default for the reduced precision setting is false, similar to pytorch.
-// https://github.com/pytorch/pytorch/issues/123157
-#[cfg(feature = "cublas")]
-static MM_F16_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "cublas")]
-static MM_BF16_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "cublas")]
-static MM_F32_REDUCED_PRECISION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// This bool controls whether reduced precision reductions (e.g., with tf32 accumulation type) are
-/// allowed with f32 GEMMs.
-#[cfg(feature = "cublas")]
-pub fn gemm_reduced_precision_f32() -> bool {
-    MM_F32_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// This bool controls whether reduced precision reductions (e.g., with tf32 accumulation type) are
-/// allowed with f32 GEMMs.
-#[cfg(feature = "cublas")]
-pub fn set_gemm_reduced_precision_f32(b: bool) {
-    MM_F32_REDUCED_PRECISION.store(b, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// This bool controls whether reduced precision reductions (e.g., with fp16 accumulation type) are
-/// allowed with f16 GEMMs.
-#[cfg(feature = "cublas")]
-pub fn gemm_reduced_precision_f16() -> bool {
-    MM_F16_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// This bool controls whether reduced precision reductions (e.g., with fp16 accumulation type) are
-/// allowed with f16 GEMMs.
-#[cfg(feature = "cublas")]
-pub fn set_gemm_reduced_precision_f16(b: bool) {
-    MM_F16_REDUCED_PRECISION.store(b, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// This bool controls whether reduced precision reductions (e.g., with fp16 accumulation type) are
-/// allowed with bf16 GEMMs.
-#[cfg(feature = "cublas")]
-pub fn gemm_reduced_precision_bf16() -> bool {
-    MM_BF16_REDUCED_PRECISION.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// This bool controls whether reduced precision reductions (e.g., with fp16 accumulation type) are
-/// allowed with bf16 GEMMs.
-#[cfg(feature = "cublas")]
-pub fn set_gemm_reduced_precision_bf16(b: bool) {
-    MM_BF16_REDUCED_PRECISION.store(b, std::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(feature = "cublas")]
-unsafe fn gemm_strided_batched_f32(
-    cublas: &cudarc::cublas::CudaBlas,
-    cfg: StridedBatchedConfig<f32>,
-    a: &cudarc::driver::CudaView<f32>,
-    b: &cudarc::driver::CudaView<f32>,
-    c: &mut CudaSlice<f32>,
-) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
-    use cudarc::cublas::sys;
-    use cudarc::driver::DevicePtrMut;
-
-    let compute_type = if gemm_reduced_precision_f32() {
-        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
-    } else {
-        sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
-    };
-    let alpha = &cfg.gemm.alpha as *const f32 as *const _;
-    let beta = &cfg.gemm.beta as *const f32 as *const _;
-
-    let stream = c.stream().clone();
-    let (a, _guard_a) = a.device_ptr(&stream);
-    let (b, _guard_b) = b.device_ptr(&stream);
-    let (c, _guard_c) = c.device_ptr_mut(&stream);
-
-    cudarc::cublas::result::gemm_strided_batched_ex(
-        *cublas.handle(),
-        cfg.gemm.transa,
-        cfg.gemm.transb,
-        cfg.gemm.m,
-        cfg.gemm.n,
-        cfg.gemm.k,
-        alpha,
-        a as *const _,
-        sys::cudaDataType_t::CUDA_R_32F,
-        cfg.gemm.lda,
-        cfg.stride_a,
-        b as *const _,
-        sys::cudaDataType_t::CUDA_R_32F,
-        cfg.gemm.ldb,
-        cfg.stride_b,
-        beta,
-        c as *mut _,
-        sys::cudaDataType_t::CUDA_R_32F,
-        cfg.gemm.ldc,
-        cfg.stride_c,
-        cfg.batch_size,
-        compute_type,
-        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-    )
-}
-
-#[cfg(feature = "cublas")]
-unsafe fn gemm_strided_batched_f16(
-    cublas: &cudarc::cublas::CudaBlas,
-    cfg: StridedBatchedConfig<f16>,
-    a: &cudarc::driver::CudaView<f16>,
-    b: &cudarc::driver::CudaView<f16>,
-    c: &mut CudaSlice<f16>,
-) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
-    use cudarc::cublas::sys;
-    use cudarc::driver::DevicePtrMut;
-
-    let alpha = cfg.gemm.alpha;
-    let beta = cfg.gemm.beta;
-    let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
-    let beta_f32: f32 = cfg.gemm.beta.to_f32();
-    let (compute_type, alpha, beta) = if gemm_reduced_precision_f16() {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
-            (&alpha) as *const f16 as *const _,
-            (&beta) as *const f16 as *const _,
-        )
-    } else {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
-    };
-
-    let stream = c.stream().clone();
-    let (a, _guard_a) = a.device_ptr(&stream);
-    let (b, _guard_b) = b.device_ptr(&stream);
-    let (c, _guard_c) = c.device_ptr_mut(&stream);
-    cudarc::cublas::result::gemm_strided_batched_ex(
-        *cublas.handle(),
-        cfg.gemm.transa,
-        cfg.gemm.transb,
-        cfg.gemm.m,
-        cfg.gemm.n,
-        cfg.gemm.k,
-        alpha,
-        a as *const _,
-        sys::cudaDataType_t::CUDA_R_16F,
-        cfg.gemm.lda,
-        cfg.stride_a,
-        b as *const _,
-        sys::cudaDataType_t::CUDA_R_16F,
-        cfg.gemm.ldb,
-        cfg.stride_b,
-        beta,
-        c as *mut _,
-        sys::cudaDataType_t::CUDA_R_16F,
-        cfg.gemm.ldc,
-        cfg.stride_c,
-        cfg.batch_size,
-        compute_type,
-        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-    )
-}
-
-#[cfg(feature = "cublas")]
-unsafe fn gemm_strided_batched_bf16(
-    cublas: &cudarc::cublas::CudaBlas,
-    cfg: StridedBatchedConfig<bf16>,
-    a: &cudarc::driver::CudaView<bf16>,
-    b: &cudarc::driver::CudaView<bf16>,
-    c: &mut CudaSlice<bf16>,
-) -> std::result::Result<(), cudarc::cublas::result::CublasError> {
-    use cudarc::cublas::sys;
-    use cudarc::driver::DevicePtrMut;
-
-    let alpha_f32: f32 = cfg.gemm.alpha.to_f32();
-    let beta_f32: f32 = cfg.gemm.beta.to_f32();
-    // The type for alpha and beta depends on the computeType.
-    // https://docs.nvidia.com/cuda/cublas/index.html#cublasgemmstridedbatchedex
-    let (compute_type, alpha, beta) = if gemm_reduced_precision_bf16() {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
-    } else {
-        (
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            (&alpha_f32) as *const f32 as *const _,
-            (&beta_f32) as *const f32 as *const _,
-        )
-    };
-
-    let stream = c.stream().clone();
-    let (a, _guard_a) = a.device_ptr(&stream);
-    let (b, _guard_b) = b.device_ptr(&stream);
-    let (c, _guard_c) = c.device_ptr_mut(&stream);
-    cudarc::cublas::result::gemm_strided_batched_ex(
-        *cublas.handle(),
-        cfg.gemm.transa,
-        cfg.gemm.transb,
-        cfg.gemm.m,
-        cfg.gemm.n,
-        cfg.gemm.k,
-        alpha,
-        a as *const _,
-        sys::cudaDataType_t::CUDA_R_16BF,
-        cfg.gemm.lda,
-        cfg.stride_a,
-        b as *const _,
-        sys::cudaDataType_t::CUDA_R_16BF,
-        cfg.gemm.ldb,
-        cfg.stride_b,
-        beta,
-        c as *mut _,
-        sys::cudaDataType_t::CUDA_R_16BF,
-        cfg.gemm.ldc,
-        cfg.stride_c,
-        cfg.batch_size,
-        compute_type,
-        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
-    )
-}
