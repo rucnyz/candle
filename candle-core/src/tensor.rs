@@ -2542,6 +2542,18 @@ impl Tensor {
                 device: self.device.clone(),
             };
             Ok(Tensor(Arc::new(tensor_)))
+        } else if let Some(new_stride) = self.layout().strided_reshape(shape.dims()) {
+            // Non-contiguous but stride-compatible: zero-copy view (like PyTorch's view).
+            let tensor_ = Tensor_ {
+                id: TensorId::new(),
+                storage: self.storage.clone(),
+                layout: Layout::new(shape, new_stride, self.layout.start_offset()),
+                op,
+                is_variable: false,
+                dtype: self.dtype,
+                device: self.device.clone(),
+            };
+            Ok(Tensor(Arc::new(tensor_)))
         } else {
             let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
             self.storage()

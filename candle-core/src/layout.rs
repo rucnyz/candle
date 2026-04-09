@@ -77,6 +77,68 @@ impl Layout {
         self.shape.is_fortran_contiguous(&self.stride)
     }
 
+    /// Compute strides for reshaping without a data copy (PyTorch's `view` semantics).
+    ///
+    /// Returns `Some(new_strides)` when the current (possibly non-contiguous) layout
+    /// can be reinterpreted as `new_shape` by just changing metadata.
+    /// Returns `None` when an actual data copy is required.
+    ///
+    /// Algorithm: partition old dims into maximal contiguous chunks (right-to-left),
+    /// then check that `new_shape` re-factors those same chunks.
+    /// Port of PyTorch `computeStride_impl` from `aten/src/ATen/TensorUtils.cpp`.
+    pub fn strided_reshape(&self, new_shape: &[usize]) -> Option<Vec<usize>> {
+        let old_shape = self.shape.dims();
+        let old_stride = &self.stride;
+        if old_shape.is_empty() {
+            return Some(vec![1; new_shape.len()]);
+        }
+
+        let mut new_stride = vec![0usize; new_shape.len()];
+        let mut view_d = new_shape.len() as isize - 1;
+
+        // Base stride of the current contiguous chunk (starts at innermost).
+        let mut chunk_base_stride = *old_stride.last().unwrap();
+        let mut tensor_numel: usize = 1;
+        let mut view_numel: usize = 1;
+
+        for tensor_d in (0..old_shape.len()).rev() {
+            tensor_numel *= old_shape[tensor_d];
+
+            // Detect chunk boundary: either leftmost dim, or next dim breaks contiguity.
+            let is_boundary = tensor_d == 0
+                || (old_shape[tensor_d - 1] != 1
+                    && old_stride[tensor_d - 1] != tensor_numel * chunk_base_stride);
+
+            if is_boundary {
+                // Consume new dims right-to-left until view_numel matches tensor_numel.
+                while view_d >= 0
+                    && (view_numel < tensor_numel || new_shape[view_d as usize] == 1)
+                {
+                    let vd = view_d as usize;
+                    new_stride[vd] = view_numel * chunk_base_stride;
+                    view_numel *= new_shape[vd];
+                    view_d -= 1;
+                }
+
+                if view_numel != tensor_numel {
+                    return None;
+                }
+
+                // Reset for next chunk.
+                if tensor_d > 0 {
+                    chunk_base_stride = old_stride[tensor_d - 1];
+                    tensor_numel = 1;
+                    view_numel = 1;
+                }
+            }
+        }
+
+        if view_d != -1 {
+            return None;
+        }
+        Some(new_stride)
+    }
+
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Self> {
         let dims = self.shape().dims();
         if dim >= dims.len() {
@@ -266,6 +328,63 @@ impl Layout {
             left_broadcast,
             right_broadcast,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(shape: &[usize], stride: &[usize], offset: usize) -> Layout {
+        Layout::new(Shape::from_dims(shape), stride.to_vec(), offset)
+    }
+
+    #[test]
+    fn strided_reshape_contiguous() {
+        // [4, 6144] contiguous → [4, 48, 128] should work (4*48*128 = 4*6144 = 24576)
+        let l = layout(&[4, 6144], &[6144, 1], 0);
+        let s = l.strided_reshape(&[4, 48, 128]).unwrap();
+        assert_eq!(s, vec![6144, 128, 1]);
+    }
+
+    #[test]
+    fn strided_reshape_narrow_then_split() {
+        // Simulate: [4, 6144].narrow(1, 0, 4096) → [4, 4096] stride [6144, 1]
+        // Then reshape to [4, 32, 128]
+        let l = layout(&[4, 4096], &[6144, 1], 0);
+        let s = l.strided_reshape(&[4, 32, 128]).unwrap();
+        // dim2: stride=1, dim1: stride=128, dim0: stride=6144 (from original)
+        assert_eq!(s, vec![6144, 128, 1]);
+    }
+
+    #[test]
+    fn strided_reshape_narrow_kv() {
+        // K after narrow: [4, 1024] stride [6144, 1], offset=4096
+        let l = layout(&[4, 1024], &[6144, 1], 4096);
+        let s = l.strided_reshape(&[4, 8, 128]).unwrap();
+        assert_eq!(s, vec![6144, 128, 1]);
+    }
+
+    #[test]
+    fn strided_reshape_incompatible() {
+        // [4, 4096] stride [6144, 1] → reshape to [16384] requires contiguous
+        let l = layout(&[4, 4096], &[6144, 1], 0);
+        assert!(l.strided_reshape(&[16384]).is_none());
+    }
+
+    #[test]
+    fn strided_reshape_transpose_incompatible() {
+        // Transposed [4, 3] stride [1, 4] → reshape to [12] should fail
+        let l = layout(&[4, 3], &[1, 4], 0);
+        assert!(l.strided_reshape(&[12]).is_none());
+    }
+
+    #[test]
+    fn strided_reshape_size_one_dims() {
+        // [1, 4096] stride [4096, 1] → [4096] should work
+        let l = layout(&[1, 4096], &[4096, 1], 0);
+        let s = l.strided_reshape(&[4096]).unwrap();
+        assert_eq!(s, vec![1]);
     }
 }
 
