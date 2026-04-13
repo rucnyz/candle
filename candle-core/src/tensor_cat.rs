@@ -27,6 +27,12 @@ impl Tensor {
             return Ok(arg0.clone());
         }
         let dim = dim.to_index(arg0.shape(), "cat")?;
+        {
+            let refs: Vec<&Tensor> = args.iter().map(|a| a.as_ref()).collect();
+            if let Some(r) = crate::hook::dispatch(|h| h.cat(&refs, dim)) {
+                return r;
+            }
+        }
         for arg in args {
             arg.as_ref().check_dim(dim, "cat")?;
         }

@@ -70,6 +70,7 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
+            Device::Custom(_) => crate::bail!("custom backend: quantized tensors not supported"),
         }
     }
 }
@@ -118,6 +119,7 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
+            Device::Custom(_) => crate::bail!("custom backend: quantized tensors not supported"),
         }
     }
 

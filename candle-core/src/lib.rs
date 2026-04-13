@@ -57,8 +57,10 @@ pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+mod custom_backend;
 mod custom_op;
 mod device;
+pub mod hook;
 pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
@@ -92,6 +94,8 @@ mod variable;
 pub use cuda_backend::cudnn;
 
 pub use cpu_backend::{CpuStorage, CpuStorageRef};
+pub use custom_backend::{CustomDevice, CustomStorage};
+pub use hook::TensorHook;
 #[cfg(feature = "ug")]
 pub use custom_op::UgIOp1;
 pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};

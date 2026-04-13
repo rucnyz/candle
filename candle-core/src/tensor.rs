@@ -78,6 +78,9 @@ impl std::ops::Deref for Tensor {
 macro_rules! unary_op {
     ($fn_name:ident, $op_name:ident) => {
         pub fn $fn_name(&self) -> Result<Self> {
+            if let Some(r) = crate::hook::dispatch(|h| h.$fn_name(self)) {
+                return r;
+            }
             let shape = self.shape();
             if shape.elem_count() == 0 {
                 return Ok(self.clone());
@@ -94,6 +97,9 @@ macro_rules! unary_op {
 macro_rules! binary_op {
     ($fn_name:ident, $op_name:ident) => {
         pub fn $fn_name(&self, rhs: &Self) -> Result<Self> {
+            if let Some(r) = crate::hook::dispatch(|h| h.$fn_name(self, rhs)) {
+                return r;
+            }
             let shape = self.same_shape_binary_op(rhs, stringify!($fn_name))?;
             if shape.elem_count() == 0 {
                 return Ok(self.clone());
@@ -119,6 +125,9 @@ macro_rules! binary_op_scalar {
                     .to_device(self.device())?
                     .broadcast_as(self.shape())?,
             };
+            if let Some(r) = crate::hook::dispatch(|h| h.$fn_name(self, &rhs)) {
+                return r;
+            }
             let shape = self.same_shape_binary_op(&rhs, stringify!($fn_name))?;
             if self.elem_count() == 0 {
                 return Ok(self.clone());
@@ -676,6 +685,7 @@ impl Tensor {
             Storage::Cpu(cpu_storage) => from_cpu_storage(cpu_storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Custom(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -782,6 +792,9 @@ impl Tensor {
     /// # Ok::<(), candle_core::Error>(())
     /// ```
     pub fn affine(&self, mul: f64, add: f64) -> Result<Self> {
+        if let Some(r) = crate::hook::dispatch(|h| h.affine(self, mul, add)) {
+            return r;
+        }
         if self.elem_count() == 0 {
             return Ok(self.clone());
         }
@@ -792,6 +805,9 @@ impl Tensor {
 
     /// Applies the Exponential Linear Unit (ELU) function on each element of the input tensor.
     pub fn elu(&self, alpha: f64) -> Result<Self> {
+        if let Some(r) = crate::hook::dispatch(|h| h.elu(self, alpha)) {
+            return r;
+        }
         if self.elem_count() == 0 {
             return Ok(self.clone());
         }
@@ -802,6 +818,9 @@ impl Tensor {
 
     /// Raise the tensor to some float exponent `e`.
     pub fn powf(&self, e: f64) -> Result<Self> {
+        if let Some(r) = crate::hook::dispatch(|h| h.powf(self, e)) {
+            return r;
+        }
         if self.elem_count() == 0 {
             return Ok(self.clone());
         }
@@ -938,6 +957,17 @@ impl Tensor {
 
     fn reduce_impl<D: Dim>(&self, dim: D, keepdim: bool, op: ReduceOp) -> Result<Self> {
         let dim = dim.to_index(self.shape(), op.name())?;
+        let hook_result = match op {
+            ReduceOp::Max => crate::hook::dispatch(|h| h.max(self, &[dim])),
+            ReduceOp::Min => crate::hook::dispatch(|h| h.min(self, &[dim])),
+            ReduceOp::ArgMax => crate::hook::dispatch(|h| h.argmax(self, dim)),
+            ReduceOp::ArgMin => crate::hook::dispatch(|h| h.argmin(self, dim)),
+            _ => None,
+        };
+        if let Some(r) = hook_result {
+            let t = r?;
+            return if keepdim { Ok(t) } else { t.squeeze(dim) };
+        }
         let storage = self.storage().reduce_op(op, self.layout(), &[dim])?;
         let mut dims = self.dims().to_vec();
         dims[dim] = 1;
@@ -957,6 +987,18 @@ impl Tensor {
 
     fn sum_impl<D: Dims>(&self, sum_dims: D, keepdim: bool) -> Result<Self> {
         let sum_dims = sum_dims.to_indexes(self.shape(), "sum")?;
+        if let Some(r) = crate::hook::dispatch(|h| h.sum(self, &sum_dims)) {
+            let t = r?;
+            if keepdim {
+                return Ok(t);
+            }
+            // squeeze reduced dims (in reverse to preserve indices)
+            let mut result = t;
+            for &d in sum_dims.iter().rev() {
+                result = result.squeeze(d)?;
+            }
+            return Ok(result);
+        }
         let storage = self
             .storage()
             .reduce_op(ReduceOp::Sum, self.layout(), &sum_dims)?;
@@ -1493,6 +1535,9 @@ impl Tensor {
     ///
     /// The resulting tensor has dimensions `b1, b2, ..., bi, m, n`.
     pub fn matmul(&self, rhs: &Self) -> Result<Self> {
+        if let Some(r) = crate::hook::dispatch(|h| h.matmul(self, rhs)) {
+            return r;
+        }
         let a_dims = self.shape().dims();
         let b_dims = rhs.shape().dims();
 
@@ -1563,6 +1608,9 @@ impl Tensor {
     /// `on_true` if the input tensor value is not zero, and `on_false` at the positions where the
     /// input tensor is equal to zero.
     pub fn where_cond(&self, on_true: &Self, on_false: &Self) -> Result<Self> {
+        if let Some(r) = crate::hook::dispatch(|h| h.where_cond(self, on_true, on_false)) {
+            return r;
+        }
         let _shap = self.same_shape_binary_op(on_true, "where_cond")?;
         let shape = self.same_shape_binary_op(on_false, "where_cond")?;
         let storage = self.storage().where_cond(
@@ -1852,6 +1900,9 @@ impl Tensor {
     /// dimension `dim` by the values in `indexes`.
     pub fn gather<D: Dim>(&self, indexes: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "gather")?;
+        if let Some(r) = crate::hook::dispatch(|h| h.gather(self, indexes, dim)) {
+            return r;
+        }
 
         let self_dims = self.dims();
         let indexes_dims = indexes.dims();
@@ -1891,6 +1942,9 @@ impl Tensor {
     /// tensor.
     pub fn index_select<D: Dim>(&self, indexes: &Self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "index-select")?;
+        if let Some(r) = crate::hook::dispatch(|h| h.index_select(self, indexes, dim)) {
+            return r;
+        }
         let indexes_len = match indexes.dims() {
             [l] => *l,
             _ => Err(Error::ShapeMismatchBinaryOp {
@@ -1948,6 +2002,7 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Custom(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -1979,6 +2034,7 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Custom(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2020,6 +2076,7 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            Storage::Custom(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
     }
 
@@ -2369,6 +2426,9 @@ impl Tensor {
         if self.device().same_device(device) {
             Ok(self.clone())
         } else {
+            if let Some(r) = crate::hook::dispatch(|h| h.to_device(self, device)) {
+                return r;
+            }
             let storage = match (&*self.storage(), device) {
                 (Storage::Cpu(storage), Device::Cuda(cuda)) => {
                     Storage::Cuda(cuda.storage_from_cpu_storage(storage)?)
@@ -2454,6 +2514,9 @@ impl Tensor {
         if self.dtype() == dtype {
             Ok(self.clone())
         } else {
+            if let Some(r) = crate::hook::dispatch(|h| h.to_dtype(self, dtype)) {
+                return r;
+            }
             let shape = self.shape();
             let storage = self.storage().to_dtype(self.layout(), dtype)?;
             let op = BackpropOp::new1(self, Op::ToDType);
@@ -2467,6 +2530,9 @@ impl Tensor {
         if self.is_contiguous() {
             Ok(self.clone())
         } else {
+            if let Some(r) = crate::hook::dispatch(|h| h.contiguous(self)) {
+                return r;
+            }
             let shape = self.shape();
             let mut storage = unsafe { self.device().alloc_uninit(shape, self.dtype())? };
             self.storage()
@@ -2555,6 +2621,11 @@ impl Tensor {
             };
             Ok(Tensor(Arc::new(tensor_)))
         } else {
+            // Non-contiguous, stride-incompatible: need a data copy.
+            // Try hook (contiguous) first, then re-reshape via the view path.
+            if let Some(r) = crate::hook::dispatch(|h| h.contiguous(self)) {
+                return r?.reshape(shape);
+            }
             let mut storage = unsafe { self.device().alloc_uninit(&shape, self.dtype())? };
             self.storage()
                 .copy_strided_src(&mut storage, 0, self.layout())?;
